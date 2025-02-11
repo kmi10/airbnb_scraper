@@ -1,0 +1,182 @@
+const puppeteer = require('puppeteer');
+const fs = require('fs');
+const path = require('path');
+const { parse } = require('json2csv');
+
+const getFormattedDate = (offsetDays = 0) => {
+    const date = new Date();
+    date.setDate(date.getDate() + offsetDays);
+    return date.toISOString().split('T')[0]; // Formato YYYY-MM-DD
+};
+
+(async () => {
+    console.log("🟢 Iniciando Puppeteer...");
+
+    const browser = await puppeteer.launch({
+        headless: false,
+        args: ['--no-sandbox', '--disable-setuid-sandbox'],
+        executablePath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    });
+
+    const page = await browser.newPage();
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36');
+
+    const baseURL = "https://www.airbnb.cl/s/";
+    const location = "Santiago-Centro--Santiago--Chile";
+    const checkin = getFormattedDate(0);
+    const checkout = getFormattedDate(8);
+    const filters = `?query=Santiago%20Centro%2C%20Santiago&adults=2&checkin=${checkin}&checkout=${checkout}`;
+
+    const searchURL = `${baseURL}${location}/homes${filters}`;
+    console.log("🔎 URL generada:", searchURL);
+
+    //await page.goto(searchURL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await page.goto(searchURL, { waitUntil: 'networkidle2', timeout: 60000 });
+
+    
+
+
+
+    
+
+    console.log("✅ Página cargada correctamente.");
+    console.log("⏳ Esperando carga de la paginación...");
+
+    await page.waitForSelector('nav[aria-label="Paginación de los resultados de búsqueda"]', { timeout: 15000 });
+
+    const totalPages = await page.evaluate(() => {
+        const pageNumbers = Array.from(document.querySelectorAll('nav[aria-label="Paginación de los resultados de búsqueda"] a'))
+            .map(el => parseInt(el.innerText))
+            .filter(num => !isNaN(num));
+
+        return pageNumbers.length > 0 ? Math.max(...pageNumbers) : 1;
+    });
+
+    console.log(`📄 Total de páginas detectadas: ${totalPages}`);
+
+    let paginationLinks = [searchURL];
+    let currentPage = 1;
+
+    while (currentPage < totalPages) {
+        console.log(`🔄 Cargando página ${currentPage + 1}...`);
+
+        const nextButton = await page.$('nav[aria-label="Paginación de los resultados de búsqueda"] a[aria-label="Siguiente"]');
+        if (!nextButton) break;
+
+        const nextPageUrl = await page.evaluate(el => el.href, nextButton);
+        paginationLinks.push(nextPageUrl);
+
+        await page.goto(nextPageUrl, { waitUntil: 'networkidle2', timeout: 60000 });
+        await new Promise(resolve => setTimeout(resolve, 3000));
+
+        currentPage++;
+    }
+
+    console.log(`📄 Total de páginas extraídas: ${paginationLinks.length}`);
+    paginationLinks.forEach((link, index) => {
+        console.log(`🔗 Página ${index + 1}: ${link}`);
+    });
+
+    const allListings = [];
+
+    for (const [index, pageUrl] of paginationLinks.entries()) {
+        console.log(`🌍 Procesando página ${index + 1}: ${pageUrl}`);
+
+        await page.goto(pageUrl, { waitUntil: 'networkidle2', timeout: 60000 });
+        await new Promise(resolve => setTimeout(resolve, 3000));
+
+        const listingLinks = await page.evaluate(() => {
+            return Array.from(document.querySelectorAll('a[href*="/rooms/"]'))
+                .map(el => el.href)
+                .filter((value, index, self) => self.indexOf(value) === index);
+        });
+
+        console.log(`✅ Se encontraron ${listingLinks.length} anuncios en la página.`);
+
+        // **Dividir el procesamiento de anuncios en bloques de 5 para evitar sobrecarga**
+        const chunkSize = 5;
+        for (let i = 0; i < listingLinks.length; i += chunkSize) {
+            const chunk = listingLinks.slice(i, i + chunkSize);
+            console.log(`🔹 Procesando ${chunk.length} anuncios en paralelo...`);
+
+            await Promise.all(chunk.map(async (listingUrl) => {
+                console.log(`➡️ Extrayendo datos de: ${listingUrl}`);
+
+                const listingPage = await browser.newPage();
+                try {
+                    await listingPage.goto(listingUrl, { waitUntil: 'networkidle2', timeout: 60000 });
+                    await new Promise(resolve => setTimeout(resolve, 3000));
+
+                    const listingData = await listingPage.evaluate(() => {
+                        const getText = (selector) => {
+                            const element = document.querySelector(selector);
+                            return element ? element.innerText.trim() : 'Sin datos';
+                        };
+
+                        const title = getText('h1');
+                        const description = getText('div.toieuka h2');
+                        const priceOriginal = getText('span._1aejdbt');
+                        const priceCurrent = getText('span._11jcbg2');
+
+                        const airbnbIdMatch = window.location.href.match(/\/rooms\/(\d+)/);
+                        const airbnbId = airbnbIdMatch ? airbnbIdMatch[1] : 'Sin ID';
+
+                        const ratingElement = document.querySelector('div[data-testid="pdp-reviews-highlight-banner-host-rating"] div[aria-hidden="true"]');
+                        const rating = ratingElement ? ratingElement.innerText.trim() : 'Sin datos';
+
+                        const reviewsElement = document.querySelector('div[data-testid="pdp-reviews-highlight-banner-host-review"] div[aria-hidden="true"]');
+                        const reviews = reviewsElement ? reviewsElement.innerText.trim() : 'Sin datos';
+
+                        const info = Array.from(document.querySelectorAll('li.l7n4lsf')).reduce((result, el) => {
+                            const text = el.innerText.trim().toLowerCase();
+
+                            if (text.includes('huéspedes')) {
+                                result.guests = text;
+                            } else if (text.includes('habitación')) {
+                                result.rooms = text;
+                            } else if (text.includes('camas')) {
+                                result.beds = text;
+                            } else if (text.includes('baños')) {
+                                result.bathrooms = text;
+                            }
+
+                            return result;
+                        }, {});
+
+                        return {
+                            airbnbId,
+                            title,
+                            description,
+                            priceOriginal,
+                            priceCurrent,
+                            rating,
+                            reviews,
+                            guests: info.guests || 'Sin datos de huéspedes',
+                            rooms: info.rooms || 'Sin datos de habitaciones',
+                            beds: info.beds || 'Sin datos de camas',
+                            bathrooms: info.bathrooms || 'Sin datos de baños',
+                        };
+                    });
+
+                    console.log(`✅ Datos extraídos:`, listingData);
+                    allListings.push(listingData);
+                } catch (error) {
+                    console.error(`❌ Error al extraer datos de ${listingUrl}:`, error);
+                } finally {
+                    await listingPage.close();
+                }
+            }));
+        }
+    }
+
+    if (allListings.length > 0) {
+        const csv = parse(allListings, { fields: Object.keys(allListings[0]) });
+        const filePath = path.join(__dirname, 'listings_with_pagination.csv');
+        fs.writeFileSync(filePath, csv, 'utf8');
+        console.log("📁 Datos guardados correctamente en listings_with_pagination.csv");
+    } else {
+        console.warn("⚠️ No se encontraron datos para guardar.");
+    }
+
+    await browser.close();
+})();
